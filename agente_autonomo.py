@@ -3,6 +3,14 @@ import numpy as np
 import re
 import unicodedata
 from sentence_transformers import SentenceTransformer, util
+from lector_pdf import procesar_pdf
+import os
+from transformers import pipeline
+from collections import Counter
+from docx2pdf import convert
+import tempfile
+import shutil
+
 
 # Funcion para normalizar texto, es decir en minusculas y sin tildes
 def normalizar(texto):
@@ -12,6 +20,33 @@ def normalizar(texto):
     return texto.strip()
 
 modelo = SentenceTransformer("all-MiniLM-L6-v2")
+
+
+def resumen_fragmentos_pdf(cursor, cantidad_oraciones=5):
+    cursor.execute("SELECT fragmento FROM pdf_conocimiento")
+    fragmentos = cursor.fetchall()
+    texto_completo = " ".join(f[0] for f in fragmentos)
+
+    oraciones = re.split(r'(?<=[.!?]) +', texto_completo)
+    palabras = re.findall(r'\b\w+\b', texto_completo.lower())
+
+    stopwords = set([
+        "el", "la", "los", "las", "de", "que", "y", "a", "en", "es", "un", "una", "con", "por", "para", "se", "al", "del"
+    ])
+    palabras = [w for w in palabras if w not in stopwords]
+
+    frecuencia = Counter(palabras)
+    oraciones_puntaje = []
+
+    for oracion in oraciones:
+        palabras_oracion = re.findall(r'\b\w+\b', oracion.lower())
+        puntaje = sum(frecuencia.get(p, 0) for p in palabras_oracion)
+        oraciones_puntaje.append((puntaje, oracion))
+
+    oraciones_puntaje.sort(reverse=True)
+    top = [o for _, o in oraciones_puntaje[:cantidad_oraciones]]
+
+    return " ".join(top)
 
 # Conexion a PostgreSQL
 conexion = psycopg2.connect(
@@ -29,6 +64,35 @@ print("Agente listo para conversar. Escribe 'salir' para terminar.\n")
 while True:
     entrada = input("Tú: ").strip()
     entrada_norm = normalizar(entrada)
+    embedding_entrada = modelo.encode(entrada_norm)
+
+    # 🚨 Petición de resumen detectada
+    if entrada_norm in ["resumen", "resumelo", "dame un resumen", "resumen del pdf", "haz un resumen"]:
+        resumen = resumen_fragmentos_pdf(cursor)
+        print("Agente (resumen):", resumen)
+        continue
+    
+    # Detectar si el usuario ingreso una ruta a un PDF
+    if entrada_norm.endswith((".pdf", ".docx")) and os.path.exists(entrada):
+        try:
+            ruta_procesar = entrada
+
+            if entrada_norm.endswith(".docx"):
+                temp_dir = tempfile.mkdtemp()
+                ruta_pdf = os.path.join(temp_dir, "convertido.pdf")
+                convert(entrada, ruta_pdf)
+                ruta_procesar = ruta_pdf  # actualiza ruta a PDF generado
+
+            procesar_pdf(ruta_procesar, cursor, conexion)
+            print("Agente: He analizado el archivo y he aprendido de él.")
+
+            if entrada_norm.endswith(".docx"):
+                shutil.rmtree(temp_dir)  # limpia temporal
+
+        except Exception as e:
+            print(f"Agente: Ocurrió un error al procesar el documento: {e}")
+        continue
+
 
     # ---------------------------
     # Comprension de frases conversacionales (como estas?, que haces, etc)
@@ -53,6 +117,34 @@ while True:
         "cansado": "Descansar un poco ayuda. animo!"
     }
 
+    # ---------------------------
+    # Intenciones negativas: "no puedes ayudarme", "no me sirves", etc.
+    intenciones_negativas = {
+        "no puedes ayudarme": "Entiendo, pero estaré aquí por si cambias de opinión.",
+        "no me sirves": "Lamento que no pueda ayudarte ahora. Intentaré mejorar.",
+        "no eres util": "Gracias por tu sinceridad. Seguiré aprendiendo.",
+        "no ayudas": "Intento hacerlo lo mejor posible. ¿Quieres explicarme más?",
+        "no entiendo para que sirves": "Puedo aprender con tu ayuda. ¿Qué necesitas saber?"
+    }
+
+    mejor_similitud_neg = 0
+    respuesta_negativa = None
+
+    for frase_ref, respuesta_ref in intenciones_negativas.items():
+        emb_ref = modelo.encode(frase_ref)
+        sim = util.cos_sim(
+            np.array(embedding_entrada).astype(np.float32),
+            np.array(emb_ref).astype(np.float32)
+        ).item()
+        if sim > mejor_similitud_neg:
+            mejor_similitud_neg = sim
+            respuesta_negativa = respuesta_ref
+
+    if mejor_similitud_neg >= 0.78:
+        print(f"Agente: {respuesta_negativa}")
+        continue
+
+
     palabra_clave = None
 
     # Detectar preguntas tipo que es?, que significa?, etc
@@ -65,7 +157,7 @@ while True:
         palabra_clave = match_sabes_significado.group(3)
 
     # Comparar por similitud semántica
-    embedding_entrada = modelo.encode(entrada_norm)
+    
     mejor_similitud_social = 0
     respuesta_social = None
 
@@ -76,9 +168,9 @@ while True:
             np.array(emb_ref).astype(np.float32)
         ).item()
 
-    if sim > mejor_similitud_social:
-        mejor_similitud_social = sim
-        respuesta_social = respuesta_ref
+        if sim > mejor_similitud_social:
+            mejor_similitud_social = sim
+            respuesta_social = respuesta_ref
 
     if mejor_similitud_social >= 0.78:
         print(f"Agente: {respuesta_social}")
@@ -260,8 +352,14 @@ while True:
     if identidad_detectada:
         continue
 
+    if entrada_norm in ["resumen", "resumelo", "dame un resumen", "resumen del pdf", "haz un resumen"]:
+        resumen = resumen_fragmentos_pdf(cursor)
+        print("Agente (resumen):", resumen)
+        continue
+
     # ---------------------------
     #Buscar por similitud en conocimiento
+    # Buscar por similitud en conocimiento
     embedding_usuario = modelo.encode(entrada_norm)
 
     cursor.execute("SELECT pregunta, respuesta, embedding FROM conocimiento")
@@ -273,11 +371,18 @@ while True:
     for pregunta_bd, respuesta_bd, embedding_txt in registros:
         if palabra_clave and palabra_clave not in pregunta_bd:
             continue
-        vector_bd = np.fromstring(embedding_txt.strip("[]"), sep=',').astype(np.float32)
-        similitud = util.cos_sim(
-            np.array(embedding_usuario).astype(np.float32),
-            vector_bd
-        ).item()
+        try:
+            vector_bd = np.fromstring(embedding_txt, sep=',').astype(np.float32)
+            if vector_bd.shape[0] != 384:
+                continue
+            similitud = util.cos_sim(
+                np.array(embedding_usuario).astype(np.float32),
+                vector_bd
+            ).item()
+        except Exception as e:
+            print(f"[WARN] Embedding corrupto en 'conocimiento': {e}")
+            continue
+
 
         if similitud > mejor_similitud:
             mejor_similitud = similitud
@@ -287,11 +392,61 @@ while True:
         print(f"Agente: {mejor_respuesta}")
         continue
 
-    # ---------------------------
-    #Si no lo sabe aun, lo aprende y lo guarda en el BD
+    # Último intento: buscar en fragmentos del PDF con vectores y extraer info después de palabra clave
+    cursor.execute("SELECT fragmento, embedding FROM pdf_conocimiento")
+    fragmentos = cursor.fetchall()
+
+    mejor_similitud = 0
+    mejor_fragmento = None
+
+    for frag, emb_txt in fragmentos:
+        try:
+            vector = np.fromstring(emb_txt, sep=',').astype(np.float32)
+            if vector.shape[0] != 384:
+                continue
+            similitud = util.cos_sim(
+                np.array(embedding_usuario).astype(np.float32),
+                vector
+            ).item()
+            if similitud > mejor_similitud:
+                mejor_similitud = similitud
+                mejor_fragmento = frag
+        except Exception as e:
+            print(f"[WARN] Fragmento corrupto: {e}")
+            continue
+
+    if mejor_fragmento and mejor_similitud >= 0.70:
+        if palabra_clave:
+            frag_norm = normalizar(mejor_fragmento)
+            idx = frag_norm.find(palabra_clave)
+            if idx != -1:
+                original = mejor_fragmento[idx:]
+                punto = original.find(".")
+                if punto != -1:
+                    respuesta = original[:punto+1].strip()
+                else:
+                    # Buscar siguiente fragmento si no hay punto
+                    respuesta = original.strip()
+                    index_actual = [f[0] for f in fragmentos].index(mejor_fragmento)
+                    for siguiente in fragmentos[index_actual+1:]:
+                        respuesta += " " + siguiente[0]
+                        if "." in siguiente[0]:
+                            break
+                    punto = respuesta.find(".")
+                    if punto != -1:
+                        respuesta = respuesta[:punto+1]
+                print("Agente (PDF):", respuesta)
+                continue
+        # Si no hay palabra clave o no se encuentra, devolver fragmento entero
+        print("Agente (PDF):", mejor_fragmento)
+        continue
+
+
+
+    # 😅 Si no lo sabe aún, lo aprende
     print("Agente: No lo sé aún... ¿me lo puedes explicar?")
     nueva_respuesta = input("Tú: ").strip()
-    embedding_str = str(list(embedding_usuario))
+    embedding_str = ','.join(str(x) for x in embedding_usuario)
 
     cursor.execute(
         "INSERT INTO conocimiento (pregunta, respuesta, embedding) VALUES (%s, %s, %s)",
@@ -300,3 +455,7 @@ while True:
     conexion.commit()
 
     print("Agente: ¡Gracias! Lo recordare para la próxima.")
+
+#C:\Users\lopez\OneDrive\Escritorio\UMG\9no Semestre\Inteligencia Artificial\Examen2\archivos\INTELIGENCIA.pdf
+#C:\Users\lopez\OneDrive\Escritorio\UMG\9no Semestre\Inteligencia Artificial\Examen2\archivos\Repaso - Segundo Examen.pdf
+#C:\Users\lopez\OneDrive\Escritorio\UMG\9no Semestre\Inteligencia Artificial\Examen2\archivos\INTELIGENCIA_docx.docx
